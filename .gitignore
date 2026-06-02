@@ -1,0 +1,22 @@
+# Runtime/cache output
+.cache/
+__pycache__/
+*.py[cod]
+
+# Input and generated EPUB artifacts
+samples/
+split-output/
+split-output copy/
+split-test-borges/
+metadata-test/
+metadata-cover-test/
+metadata-wuyuan-cover-test/
+*.epub
+
+# Reports/logs from dry runs
+reports/
+
+# Local OS/editor files
+.DS_Store
+.idea/
+.vscode/

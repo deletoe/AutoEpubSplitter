@@ -1,0 +1,3 @@
+[submodule "EpubSplit"]
+	path = EpubSplit
+	url = https://github.com/JimmXinu/EpubSplit.git

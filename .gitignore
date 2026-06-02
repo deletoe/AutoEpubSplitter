@@ -15,6 +15,7 @@ metadata-wuyuan-cover-test/
 
 # Reports/logs from dry runs
 reports/
+dist/
 
 # Local OS/editor files
 .DS_Store

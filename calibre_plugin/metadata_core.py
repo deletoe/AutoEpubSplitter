@@ -86,6 +86,8 @@ def clean_text(value: Any, limit: Optional[int] = None) -> str:
 def strip_title_noise(title: str) -> str:
     title = clean_text(title)
     title = re.sub(r"^\s*[《「“\"]?(.+?)[》」”\"]?\s*$", r"\1", title)
+    title = re.sub(r"\s*[（(]\s*[上中下]+(?:[、,，和 ]*[上中下]+)*\s*[）)]\s*$", "", title)
+    title = re.sub(r"\s*[（(]\s*(?:上|中|下)?\s*(?:册|卷)\s*[）)]\s*$", "", title)
     title = re.sub(r"\s*（[^）]*(套装|全集|推荐|新版|珍藏|插图|纪念|精装|修订)[^）]*）\s*$", "", title)
     title = re.sub(r"\s*\([^)]*(套装|全集|推荐|新版|珍藏|插图|纪念|精装|修订)[^)]*\)\s*$", "", title)
     title = re.sub(r"\s*[:：]\s*(豆瓣.*|.*推荐.*|.*经典.*)$", "", title)
@@ -461,8 +463,13 @@ def normalize_author(author: str) -> str:
     author = re.sub(r"^〔([^〕]+)〕", r"[\1] ", author)
     author = re.sub(r"^\[(.*?)\]\s*", lambda m: f"[{m.group(1).strip()}] ", author)
     if not author.startswith("["):
-        known = {"三岛由纪夫": "[日] 三岛由纪夫"}
-        compact = re.sub(r"[\s,，.。;；]", "", author)
+        known = {
+            "三岛由纪夫": "[日] 三岛由纪夫",
+            "维克多雨果": "[法] 维克多·雨果",
+            "雨果": "[法] 维克多·雨果",
+            "VictorHugo": "[法] 维克多·雨果",
+        }
+        compact = re.sub(r"[·\s,，.。;；]", "", author)
         if compact in known:
             return known[compact]
     return author
@@ -997,7 +1004,9 @@ def find_metadata(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Nam
     sources = set(getattr(args, "metadata_sources", None) or ["douban"])
     candidates: List[Dict[str, Any]] = []
     if "douban" in sources:
-        candidates += douban_suggest(title, author_hint, args.cache_dir, args.delay)
+        candidates += douban_suggest(title, "", args.cache_dir, args.delay)
+        if author_hint:
+            candidates += douban_suggest(title, author_hint, args.cache_dir, args.delay)
         if author_hint:
             candidates += douban_search(f"{title} {author_hint}", args.cache_dir, args.delay)
         candidates += douban_search(title, args.cache_dir, args.delay)

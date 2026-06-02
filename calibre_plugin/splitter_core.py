@@ -568,7 +568,13 @@ def detect_split_ranges(
     }
 
 
-def write_split_outputs(epub_path: Path, output_dir: Path, ranges: List[Dict[str, Any]], overwrite: bool = True) -> List[Path]:
+def write_split_outputs(
+    epub_path: Path,
+    output_dir: Path,
+    ranges: List[Dict[str, Any]],
+    overwrite: bool = True,
+    progress: Optional[Any] = None,
+) -> List[Path]:
     """Write split EPUB files and return their paths."""
     epubsplit = load_epubsplit()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -579,6 +585,8 @@ def write_split_outputs(epub_path: Path, output_dir: Path, ranges: List[Dict[str
         out_path = output_dir / safe_filename(item["title"], index)
         if out_path.exists() and not overwrite:
             raise FileExistsError(f"{out_path} exists; pass overwrite=True to replace it")
+        if progress:
+            progress(index, len(ranges), item["title"])
         splitter.write_split_epub(
             str(out_path),
             [str(x) for x in item["lines"]],

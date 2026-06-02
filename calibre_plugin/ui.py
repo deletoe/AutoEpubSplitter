@@ -5,15 +5,171 @@ import shutil
 import tempfile
 import traceback
 from pathlib import Path
+from zipfile import ZipFile
+from xml.dom.minidom import parseString
 
 from calibre.ebooks.metadata import MetaInformation
 from calibre.gui2 import error_dialog, info_dialog, question_dialog
 from calibre.gui2.actions import InterfaceAction
-from calibre_plugins.auto_epub_splitter import splitter_core
-from qt.core import QApplication, QCursor, QIcon, QPixmap, Qt
+from calibre_plugins.auto_epub_splitter import metadata_core, splitter_core
+from qt.core import (
+    QDialog,
+    QHBoxLayout,
+    QIcon,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QPixmap,
+    QTextCursor,
+    QTextEdit,
+    QThread,
+    QVBoxLayout,
+    pyqtSignal,
+)
 
 
 PLUGIN_ICONS = ["images/icon.png"]
+
+
+class ProgressDialog(QDialog):
+    def __init__(self, parent, title, message):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(360)
+
+        self.label = QLabel(message)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.close_button = QPushButton("Close")
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.accept)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.log)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
+
+    def set_status(self, message):
+        self.label.setText(message)
+
+    def set_progress(self, current, total):
+        total = max(int(total or 0), 1)
+        current = max(0, min(int(current or 0), total))
+        self.progress.setRange(0, total)
+        self.progress.setValue(current)
+
+    def append_log(self, message):
+        self.log.append(str(message))
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def finish(self, message=None):
+        if message:
+            self.set_status(message)
+        self.close_button.setEnabled(True)
+
+    def closeEvent(self, event):
+        if self.close_button.isEnabled():
+            event.accept()
+        else:
+            event.ignore()
+
+
+class DetectWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, epub_path):
+        QThread.__init__(self)
+        self.epub_path = Path(epub_path)
+
+    def run(self):
+        try:
+            self.progress.emit("Reading EPUB structure...")
+            report = splitter_core.detect_split_ranges(self.epub_path)
+            self.progress.emit("Detected {0} split target(s).".format(len(report.get("books") or [])))
+            self.finished_ok.emit(report)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class SplitMetadataWorker(QThread):
+    status = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    log = pyqtSignal(str)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, epub_path, temp_dir, books):
+        QThread.__init__(self)
+        self.epub_path = Path(epub_path)
+        self.temp_dir = Path(temp_dir)
+        self.books = list(books)
+
+    def run(self):
+        try:
+            total = max(len(self.books) * 2, 1)
+            done = 0
+
+            split_dir = self.temp_dir / "split"
+            enriched_dir = self.temp_dir / "enriched"
+            enriched_dir.mkdir(parents=True, exist_ok=True)
+
+            self.status.emit("Writing split EPUBs...")
+
+            def split_progress(index, count, title):
+                self.log.emit("[split {0}/{1}] {2}".format(index, count, title))
+                self.progress.emit(index - 1, total)
+
+            output_paths = splitter_core.write_split_outputs(
+                self.epub_path,
+                split_dir,
+                self.books,
+                overwrite=True,
+                progress=split_progress,
+            )
+            done = len(output_paths)
+            self.progress.emit(done, total)
+
+            results = []
+            args = metadata_core.default_args()
+            for index, (item, output_path) in enumerate(zip(self.books, output_paths), 1):
+                self.status.emit("Enriching metadata {0}/{1}...".format(index, len(output_paths)))
+                self.log.emit("[metadata {0}/{1}] {2}".format(index, len(output_paths), item.get("title", "")))
+                enriched_path = enriched_dir / output_path.name
+                metadata_report = None
+                final_path = output_path
+                try:
+                    metadata_report = metadata_core.enrich_epub_file(output_path, enriched_path, args)
+                    final_path = enriched_path
+                    metadata = metadata_report.get("metadata") or {}
+                    self.log.emit(
+                        "  -> {0} / {1} [{2}]".format(
+                            metadata.get("title") or item.get("title", ""),
+                            "; ".join(metadata.get("authors") or []),
+                            metadata.get("_match", ""),
+                        )
+                    )
+                except Exception as exc:
+                    self.log.emit("  metadata failed, keeping split EPUB: {0}".format(exc))
+
+                results.append({"book": item, "path": str(final_path), "metadata_report": metadata_report})
+                done = len(output_paths) + index
+                self.progress.emit(done, total)
+
+            self.status.emit("Finished splitting and metadata enrichment.")
+            self.finished_ok.emit(results)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
 
 
 class AutoEpubSplitterAction(InterfaceAction):
@@ -42,56 +198,14 @@ class AutoEpubSplitterAction(InterfaceAction):
         self.qaction.setEnabled(loc == "library")
 
     def plugin_button(self):
-        selected_ids = list(self.gui.library_view.get_selected_ids())
-        if len(selected_ids) != 1:
-            error_dialog(
-                self.gui,
-                "Select One Book",
-                "Please select exactly one EPUB collection.",
-                show=True,
-            )
+        context = self._selected_epub_context()
+        if context is None:
             return
+        db, book_id, source_mi, epub_path = context
 
-        db = self.gui.current_db
-        book_id = selected_ids[0]
-        epub_abspath = db.format_abspath(book_id, "EPUB", index_is_id=True)
-        if not epub_abspath:
-            error_dialog(
-                self.gui,
-                "No EPUB",
-                "The selected book does not have an EPUB format.",
-                show=True,
-            )
+        report = self._detect_with_progress(epub_path)
+        if report is None:
             return
-
-        source_mi = db.get_metadata(book_id, index_is_id=True)
-        epub_path = Path(epub_abspath)
-        if not epub_path.exists():
-            error_dialog(
-                self.gui,
-                "EPUB Not Found",
-                "Calibre reported an EPUB format, but the file could not be found on disk.",
-                det_msg=str(epub_path),
-                show=True,
-            )
-            return
-
-        try:
-            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-            self.gui.status_bar.show_message("Detecting split points...", 60000)
-            report = splitter_core.detect_split_ranges(epub_path)
-        except Exception as exc:
-            error_dialog(
-                self.gui,
-                "Split Detection Failed",
-                "Auto EPUB Splitter could not detect split points for this EPUB.",
-                det_msg=traceback.format_exc(),
-                show=True,
-            )
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.gui.status_bar.show_message("Finished detecting split points.", 3000)
 
         books = report.get("books") or []
         if not books:
@@ -108,7 +222,7 @@ class AutoEpubSplitterAction(InterfaceAction):
         if not question_dialog(
             self.gui,
             "Auto EPUB Splitter",
-            "Create {count} split books from:\n{title}".format(count=len(books), title=source_mi.title),
+            "Create and enrich {count} split books from:\n{title}".format(count=len(books), title=source_mi.title),
             det_msg=detail,
             show_copy_button=True,
             yes_text="Create",
@@ -117,34 +231,12 @@ class AutoEpubSplitterAction(InterfaceAction):
             return
 
         temp_dir = Path(tempfile.mkdtemp(prefix="auto-epub-splitter-"))
-        created_ids = []
         try:
-            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-            self.gui.status_bar.show_message("Writing split EPUBs...", 60000)
-            output_paths = splitter_core.write_split_outputs(epub_path, temp_dir, books, overwrite=True)
-            for item, output_path in zip(books, output_paths):
-                new_id = self._add_split_book(db, book_id, source_mi, item, output_path)
-                created_ids.append(new_id)
-
-            db.commit()
-            self.gui.library_view.model().books_added(len(created_ids))
-            self.gui.library_view.model().refresh_ids(created_ids)
-            self.gui.library_view.select_rows(created_ids)
-            self.gui.tags_view.recount()
-            if self.gui.cover_flow:
-                self.gui.cover_flow.dataChanged()
-        except Exception as exc:
-            error_dialog(
-                self.gui,
-                "Split Failed",
-                "Auto EPUB Splitter failed while creating split books.",
-                det_msg=traceback.format_exc(),
-                show=True,
-            )
-            return
+            results = self._split_and_enrich_with_progress(epub_path, temp_dir, books)
+            if results is None:
+                return
+            created_ids = self._add_results_to_calibre(db, book_id, source_mi, results)
         finally:
-            QApplication.restoreOverrideCursor()
-            self.gui.status_bar.show_message("Finished writing split EPUBs.", 3000)
             shutil.rmtree(str(temp_dir), ignore_errors=True)
 
         info_dialog(
@@ -154,6 +246,95 @@ class AutoEpubSplitterAction(InterfaceAction):
             det_msg=detail,
             show=True,
         )
+
+    def _selected_epub_context(self):
+        selected_ids = list(self.gui.library_view.get_selected_ids())
+        if len(selected_ids) != 1:
+            error_dialog(self.gui, "Select One Book", "Please select exactly one EPUB collection.", show=True)
+            return None
+
+        db = self.gui.current_db
+        book_id = selected_ids[0]
+        epub_abspath = db.format_abspath(book_id, "EPUB", index_is_id=True)
+        if not epub_abspath:
+            error_dialog(self.gui, "No EPUB", "The selected book does not have an EPUB format.", show=True)
+            return None
+
+        epub_path = Path(epub_abspath)
+        if not epub_path.exists():
+            error_dialog(
+                self.gui,
+                "EPUB Not Found",
+                "Calibre reported an EPUB format, but the file could not be found on disk.",
+                det_msg=str(epub_path),
+                show=True,
+            )
+            return None
+
+        return db, book_id, db.get_metadata(book_id, index_is_id=True), epub_path
+
+    def _detect_with_progress(self, epub_path):
+        dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Detecting split points...")
+        state = {"report": None, "error": None}
+        worker = DetectWorker(epub_path)
+        worker.progress.connect(dialog.append_log)
+        worker.finished_ok.connect(lambda report: state.update(report=report))
+        worker.failed.connect(lambda error: state.update(error=error))
+        worker.finished.connect(lambda: dialog.finish("Detection finished."))
+        worker.finished.connect(dialog.accept)
+        worker.start()
+        dialog.exec_()
+        worker.wait()
+        if state["error"]:
+            error_dialog(
+                self.gui,
+                "Split Detection Failed",
+                "Auto EPUB Splitter could not detect split points for this EPUB.",
+                det_msg=state["error"],
+                show=True,
+            )
+            return None
+        return state["report"]
+
+    def _split_and_enrich_with_progress(self, epub_path, temp_dir, books):
+        dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Preparing split job...")
+        state = {"results": None, "error": None}
+        worker = SplitMetadataWorker(epub_path, temp_dir, books)
+        worker.status.connect(dialog.set_status)
+        worker.progress.connect(dialog.set_progress)
+        worker.log.connect(dialog.append_log)
+        worker.finished_ok.connect(lambda results: state.update(results=results))
+        worker.failed.connect(lambda error: state.update(error=error))
+        worker.finished.connect(lambda: dialog.finish("Processing finished."))
+        worker.finished.connect(dialog.accept)
+        worker.start()
+        dialog.exec_()
+        worker.wait()
+        if state["error"]:
+            error_dialog(
+                self.gui,
+                "Split Failed",
+                "Auto EPUB Splitter failed while creating split books.",
+                det_msg=state["error"],
+                show=True,
+            )
+            return None
+        return state["results"] or []
+
+    def _add_results_to_calibre(self, db, source_id, source_mi, results):
+        created_ids = []
+        for result in results:
+            new_id = self._add_split_book(db, source_id, source_mi, result)
+            created_ids.append(new_id)
+
+        db.commit()
+        self.gui.library_view.model().books_added(len(created_ids))
+        self.gui.library_view.model().refresh_ids(created_ids)
+        self.gui.library_view.select_rows(created_ids)
+        self.gui.tags_view.recount()
+        if self.gui.cover_flow:
+            self.gui.cover_flow.dataChanged()
+        return created_ids
 
     def _format_detection_detail(self, report):
         lines = [
@@ -181,17 +362,62 @@ class AutoEpubSplitterAction(InterfaceAction):
             lines.extend(str(note) for note in notes)
         return "\n".join(lines)
 
-    def _add_split_book(self, db, source_id, source_mi, item, output_path):
-        mi = MetaInformation(item.get("title") or "Split EPUB", source_mi.authors)
+    def _add_split_book(self, db, source_id, source_mi, result):
+        item = result.get("book") or {}
+        metadata_report = result.get("metadata_report") or {}
+        metadata = metadata_report.get("metadata") or {}
+        title = metadata.get("title") or item.get("title") or "Split EPUB"
+        authors = metadata.get("authors") or source_mi.authors
+
+        mi = MetaInformation(title, authors)
         mi.languages = source_mi.languages
-        mi.tags = list(source_mi.tags or [])
-        mi.comments = (
-            "<div><p>Split from: <em>{title}</em></p></div>".format(title=html.escape(source_mi.title))
-            if source_mi.title
-            else None
-        )
+        mi.tags = list(metadata.get("tags") or source_mi.tags or [])
+        if metadata.get("publisher"):
+            mi.publisher = metadata.get("publisher")
+        if metadata.get("description"):
+            mi.comments = metadata.get("description")
+        elif source_mi.title:
+            mi.comments = "<div><p>Split from: <em>{title}</em></p></div>".format(title=html.escape(source_mi.title))
+        identifiers = {}
+        if metadata.get("isbn"):
+            identifiers["isbn"] = str(metadata.get("isbn"))
+        if metadata.get("id"):
+            identifiers["douban"] = str(metadata.get("id"))
+        if identifiers:
+            mi.set_identifiers(identifiers)
+
         new_id = db.create_book_entry(mi, add_duplicates=True)
-        if getattr(source_mi, "has_cover", False):
+        cover_bytes = self._read_epub_cover_bytes(Path(result.get("path")))
+        if cover_bytes:
+            db.set_cover(new_id, cover_bytes)
+        elif getattr(source_mi, "has_cover", False):
             db.set_cover(new_id, db.cover(source_id, index_is_id=True))
-        db.add_format_with_hooks(new_id, "EPUB", str(output_path), index_is_id=True)
+        db.add_format_with_hooks(new_id, "EPUB", str(result.get("path")), index_is_id=True)
         return new_id
+
+    def _read_epub_cover_bytes(self, epub_path):
+        try:
+            with ZipFile(epub_path) as epub:
+                container = parseString(epub.read("META-INF/container.xml"))
+                opf_name = container.getElementsByTagName("rootfile")[0].getAttribute("full-path")
+                dom = parseString(epub.read(opf_name))
+                manifest = {}
+                for item in dom.getElementsByTagName("item"):
+                    manifest[item.getAttribute("id")] = item.getAttribute("href")
+                cover_href = ""
+                for meta in dom.getElementsByTagName("meta"):
+                    if meta.getAttribute("name").lower() == "cover":
+                        cover_href = manifest.get(meta.getAttribute("content"), "")
+                        break
+                if not cover_href:
+                    for item in dom.getElementsByTagName("item"):
+                        if item.getAttribute("media-type").startswith("image/") and "cover" in item.getAttribute("href").lower():
+                            cover_href = item.getAttribute("href")
+                            break
+                if not cover_href:
+                    return None
+                base = str(Path(opf_name).parent)
+                cover_path = cover_href if base == "." else "{0}/{1}".format(base, cover_href)
+                return epub.read(cover_path)
+        except Exception:
+            return None

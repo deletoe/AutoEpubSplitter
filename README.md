@@ -1,99 +1,181 @@
 # AutoEpubSplitter
 
-第一步目标：把 EPUB 合集自动拆成单册 EPUB，并给输出文件写入基础标题元数据。
+English | [简体中文](README.zh-CN.md)
 
-脚本复用 `EpubSplit/epubsplit.py` 负责实际 EPUB 拆分和资源重写，`auto_split_epub.py`
-负责识别每本书的起始断点：
+AutoEpubSplitter is a Calibre plugin and command-line toolkit for splitting EPUB collection books into individual volumes, then enriching the resulting EPUB metadata.
 
-1. 默认会尝试调用 OpenAI-compatible vLLM：`http://10.130.92.107:8000`。
-2. vLLM 不可用、超时或返回无效 JSON 时，自动回退到 EPUB 目录树/标题启发式。
-3. 支持 `--dry-run` 先查看识别出的书名和 line 范围。
+It is designed for messy real-world EPUB collections where table-of-contents structure, HTML layout, title formatting, and cover placement are not standardized. The splitter can use a local OpenAI-compatible LLM to judge book boundaries, while EPUB rewriting is handled with bundled code adapted from the GPLv3 EpubSplit plugin.
 
-## 安装依赖
+## Features
+
+- Split EPUB collections into single-book EPUBs.
+- Keep multi-volume continuous works together when appropriate, such as a novel split into upper/middle/lower volumes.
+- Use a local OpenAI-compatible LLM for split-point detection, author extraction, cover-image selection, and metadata cleanup.
+- Conservative heuristic fallback when the LLM is unavailable.
+- Enrich metadata from Douban Books and optionally Google Books.
+- Prefer covers already embedded in the EPUB; download metadata-source covers only when no internal cover is found.
+- Calibre GUI with progress/log windows for long-running jobs.
+- Command-line scripts for batch or debugging workflows.
+
+## License
+
+This project is released under GPLv3. See [LICENSE](LICENSE).
+
+AutoEpubSplitter bundles and adapts code from [EpubSplit](https://github.com/JimmXinu/EpubSplit), also GPLv3, by Jim Miller. See [NOTICE](NOTICE) and `calibre_plugin/epubsplit_LICENSE.txt`.
+
+Metadata providers such as Douban Books and Google Books are external services. Users are responsible for following their terms of service. The tool uses conservative request rates and local caching by default.
+
+## Get The Source
+
+```bash
+git clone https://github.com/deletoe/AutoEpubSplitter.git
+cd AutoEpubSplitter
+git submodule update --init --recursive
+```
+
+Install Python dependencies if you plan to use the command-line scripts:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-## 只预览拆分点
+## Build The Calibre Plugin
 
 ```bash
-python3 auto_split_epub.py --dry-run "samples/博尔赫斯全集第二辑（套装共12册） (【阿根廷】豪尔赫·路易斯·博尔赫斯) (z-library.sk, 1lib.sk, z-lib.sk).epub"
+python3 build_calibre_plugin.py
 ```
 
-如果想跳过大模型，直接用目录启发式：
+The plugin zip will be written to:
+
+```text
+dist/AutoEpubSplitter.zip
+```
+
+## Install In Calibre
+
+1. Open Calibre.
+2. Go to `Preferences` -> `Plugins`.
+3. Click `Load plugin from file`.
+4. Select `dist/AutoEpubSplitter.zip`.
+5. Accept Calibre's third-party plugin warning.
+6. Restart Calibre.
+7. Select one book that has an EPUB format.
+8. Click the `Auto EPUB Splitter` toolbar button.
+
+The plugin first detects split points and shows a confirmation dialog. After you confirm, it writes split EPUBs, enriches metadata, and adds the new books to the current Calibre library.
+
+For safety, test the plugin in a temporary Calibre library before using it on a large production library.
+
+## Plugin Configuration
+
+In Calibre:
+
+`Preferences` -> `Plugins` -> `AutoEpubSplitter` -> `Customize plugin`
+
+Available settings include:
+
+- Enable or disable local LLM usage.
+- OpenAI-compatible base URL.
+- Model name. Leave empty to use the first model returned by `/v1/models`.
+- Split-detection LLM timeout.
+- Metadata-cleanup LLM timeout.
+- Enable cover vision selection.
+- Cover vision timeout.
+- Enable author extraction from front matter.
+- Enable cautious LLM fallback descriptions when metadata sources miss.
+- Enable Douban Books metadata source.
+- Enable Google Books metadata source.
+- Optional Google Books API key.
+- Metadata request delay.
+- Max metadata candidates per book.
+- HTTP cache directory.
+
+The default LLM URL is a local/private example used during development. Change it to your own OpenAI-compatible endpoint, such as a local vLLM server. You can also disable LLM usage and rely on heuristic fallback plus metadata-source scoring.
+
+## Command-Line Splitter
+
+Preview split points:
 
 ```bash
-python3 auto_split_epub.py --no-llm --dry-run "samples/三岛由纪夫作品集 (套装共15册) (三岛由纪夫 (Mishima Yukio)) (z-library.sk, 1lib.sk, z-lib.sk).epub"
+python3 auto_split_epub.py --dry-run "samples/example-collection.epub"
 ```
 
-## 执行拆分
+Skip the LLM and use heuristics:
 
 ```bash
-python3 auto_split_epub.py --no-llm --overwrite -o split-output "samples/博尔赫斯全集第二辑（套装共12册） (【阿根廷】豪尔赫·路易斯·博尔赫斯) (z-library.sk, 1lib.sk, z-lib.sk).epub"
+python3 auto_split_epub.py --no-llm --dry-run "samples/example-collection.epub"
 ```
 
-常用参数：
-
-- `--vllm-base-url`: 指定 vLLM 地址，默认读取 `VLLM_BASE_URL`，否则使用 `http://10.130.92.107:8000`
-- `--model`: 指定模型名；不传时自动读取 `/v1/models` 的第一个模型
-- `--llm-timeout`: 等待 vLLM 的秒数，默认 120
-- `--expected-count`: 可选的预计输出数量提示；不传就不提供数量信息，也不会从文件名猜测。传入后只作为检测提示，不会强行裁剪结果
-- `--report report.json`: 保存识别报告
-
-默认 prompt 会把目录树和带标题的候选断点交给 LLM，并明确说明：通常拆到单册出版物；遇到父级系列/主题分组时选择子级真实书名；遇到连续作品的上下册、多卷本时可保留为一个整体 EPUB。
-
-## 搜索并写入元数据
-
-`enrich_epub_metadata.py` 会先读取 EPUB 现有标题/作者，再温和地查询豆瓣读书：
-
-1. 使用豆瓣 suggest 和搜索页拿候选。
-2. 低频请求详情页，默认每个未缓存请求间隔 3 秒。
-3. 用本地 vLLM 选择候选并清洗标题/作者；失败时使用保守评分 fallback。
-4. 写入标题、主要作者、简介、封面、ISBN/豆瓣 ID、出版社、日期、标签、评分等。
-
-封面会优先使用 EPUB 内部资源：
-
-- 先读取 OPF 已声明的 cover。
-- 如果 OPF 没声明，会检查前几个排版页，寻找 `Cover`/`封面` 页面里的大幅竖图。
-- 默认会把前几张高分候选图和书名/作者发给支持视觉的 vLLM 判断；模型不可用或不支持视觉时自动回退到规则判断。
-- 只有 EPUB 内部找不到封面时，才会尝试使用豆瓣封面。
-
-作者线索会优先从更可靠的位置来：
-
-- 如果 OPF 里只有一个非泛化作者，会自动视为可信作者，后续搜索和写入都优先使用这个作者。
-- 多作者合集默认会读取每本拆分 EPUB 的前几页文本，让 LLM 抽取主要作者/编者；抽不到就留空，不再强行沿用合集级作者。
-- 从正文抽出的作者会用于 `标题 + 作者` 搜索，并且会过滤掉作者明显不匹配的豆瓣候选。
-
-先预览，不写文件：
+Write split EPUBs:
 
 ```bash
-python3 enrich_epub_metadata.py --dry-run split-output/01-寻路中国.epub
+python3 auto_split_epub.py --overwrite -o split-output "samples/example-collection.epub"
 ```
 
-批量写到新目录：
+Common options:
+
+- `--vllm-base-url`: OpenAI-compatible endpoint. Defaults to `VLLM_BASE_URL`, then the built-in development default.
+- `--model`: Model id. Defaults to the first `/v1/models` entry.
+- `--llm-timeout`: Seconds to wait for the LLM.
+- `--expected-count`: Optional output-count hint. It is only a hint and does not force trimming or padding.
+- `--report report.json`: Write a split detection report.
+
+## Command-Line Metadata Enrichment
+
+Dry-run one EPUB:
+
+```bash
+python3 enrich_epub_metadata.py --dry-run split-output/01-example.epub
+```
+
+Write enriched EPUBs to a new directory:
 
 ```bash
 python3 enrich_epub_metadata.py -o metadata-output split-output
 ```
 
-原地替换前建议先 dry-run 或写到新目录确认：
+Replace files in place:
 
 ```bash
 python3 enrich_epub_metadata.py --inplace split-output
 ```
 
-常用参数：
+Use both Douban and Google Books:
 
-- `--delay 5`: 放慢豆瓣/封面未缓存请求
-- `--cache-dir .cache/douban`: HTTP 缓存目录
-- `--max-candidates 5`: 每本书最多抓取详情的候选数量
-- `--no-llm`: 不调用 LLM，只用豆瓣候选评分和解析结果
-- `--no-author-extract`: 不从正文前几页抽取作者
-- `--author-front-files 8`: 抽取作者时读取前几个 HTML 文件
-- `--author-front-chars 6000`: 抽取作者时最多发送给 LLM 的文本长度
-- `--no-cover-vision`: 不调用视觉模型确认内置封面，直接使用规则识别
-- `--cover-vision-timeout 45`: 每次封面视觉确认的等待秒数
-- `--llm-describe-miss`: 豆瓣 miss 时允许 LLM 谨慎补一条简介；默认 miss 不写简介，避免把未验证信息写得像真元数据
-- `--work-hard`: 预留给后续更积极的封面/网络搜索；当前不会额外爬取
-- `--report metadata-report.json`: 保存每本书的匹配和写入结果
+```bash
+python3 enrich_epub_metadata.py \
+  --metadata-source douban \
+  --metadata-source google_books \
+  split-output
+```
+
+Common options:
+
+- `--delay 5`: Slow down uncached metadata/cover requests.
+- `--cache-dir .cache/douban`: HTTP cache directory.
+- `--max-candidates 5`: Maximum candidates to inspect per book.
+- `--metadata-source douban`: Query Douban Books. Can be repeated.
+- `--metadata-source google_books`: Query Google Books. Can be repeated.
+- `--google-books-api-key`: Optional Google Books API key.
+- `--no-llm`: Do not call the LLM.
+- `--no-author-extract`: Do not ask the LLM to extract authors from front matter.
+- `--no-cover-vision`: Do not ask a vision-capable LLM to choose internal covers.
+- `--llm-describe-miss`: Let the LLM write cautious descriptions when metadata sources miss.
+- `--report metadata-report.json`: Write a metadata report.
+
+## Development Notes
+
+The repository intentionally ignores sample EPUBs, generated split outputs, caches, reports, and plugin build artifacts. Bring your own test EPUBs under `samples/` when developing locally.
+
+Run a quick plugin build check:
+
+```bash
+python3 build_calibre_plugin.py
+unzip -l dist/AutoEpubSplitter.zip
+```
+
+On macOS with Calibre installed in `/Applications`, you can run plugin import checks with:
+
+```bash
+/Applications/calibre.app/Contents/MacOS/calibre-debug -c "print('calibre ok')"
+```

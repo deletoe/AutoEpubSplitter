@@ -1,0 +1,31 @@
+AutoEpubSplitter
+================
+
+AutoEpubSplitter is licensed under the GNU General Public License version 3.
+See LICENSE for the full license text.
+
+Bundled Third-Party Code
+------------------------
+
+This project bundles and adapts EPUB splitting code from EpubSplit:
+
+    Project: EpubSplit
+    Upstream: https://github.com/JimmXinu/EpubSplit
+    Author: Jim Miller
+    License: GNU General Public License version 3
+
+The bundled files include:
+
+    calibre_plugin/epubsplit.py
+    calibre_plugin/epubsplit_LICENSE.txt
+
+The repository also keeps EpubSplit as a git submodule for development and
+reference.
+
+External Metadata Services
+--------------------------
+
+AutoEpubSplitter can query external metadata services such as Douban Books and
+Google Books. These services are not bundled with this project. Users are
+responsible for complying with the terms of service of any metadata provider
+they enable.

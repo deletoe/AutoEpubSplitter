@@ -3,6 +3,7 @@ AutoEpubSplitter
 Automatically split EPUB collections into single-book EPUBs, then enrich
 metadata from EPUB front matter, Douban, and a local OpenAI-compatible model.
 
-This is an early Calibre plugin scaffold. The command-line tools in the project
-are currently the production path; the plugin will gradually absorb that logic.
+License: GNU GPL v3.
 
+This plugin bundles and adapts EPUB splitting code from EpubSplit by Jim Miller,
+also licensed under GNU GPL v3.

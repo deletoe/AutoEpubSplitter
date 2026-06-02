@@ -20,5 +20,15 @@ class AutoEpubSplitterBase(InterfaceActionBase):
     actual_plugin = "calibre_plugins.auto_epub_splitter.ui:AutoEpubSplitterAction"
 
     def is_customizable(self):
-        return False
+        return True
 
+    def config_widget(self):
+        from calibre_plugins.auto_epub_splitter.config import ConfigWidget
+
+        return ConfigWidget(self.actual_plugin_)
+
+    def save_settings(self, config_widget):
+        config_widget.save_settings()
+        ac = self.actual_plugin_
+        if ac is not None:
+            ac.apply_settings()

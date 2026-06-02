@@ -11,6 +11,7 @@ from xml.dom.minidom import parseString
 from calibre.ebooks.metadata import MetaInformation
 from calibre.gui2 import error_dialog, info_dialog, question_dialog
 from calibre.gui2.actions import InterfaceAction
+from calibre_plugins.auto_epub_splitter.config import get_prefs
 from calibre_plugins.auto_epub_splitter import metadata_core, splitter_core
 from qt.core import (
     QDialog,
@@ -83,19 +84,31 @@ class ProgressDialog(QDialog):
             event.ignore()
 
 
+def model_or_none(value):
+    value = str(value or "").strip()
+    return value or None
+
+
 class DetectWorker(QThread):
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, epub_path):
+    def __init__(self, epub_path, settings):
         QThread.__init__(self)
         self.epub_path = Path(epub_path)
+        self.settings = dict(settings)
 
     def run(self):
         try:
             self.progress.emit("Reading EPUB structure...")
-            report = splitter_core.detect_split_ranges(self.epub_path)
+            report = splitter_core.detect_split_ranges(
+                self.epub_path,
+                use_llm=bool(self.settings.get("use_llm", True)),
+                vllm_base_url=self.settings.get("vllm_base_url") or splitter_core.DEFAULT_VLLM_BASE_URL,
+                model=model_or_none(self.settings.get("model")),
+                llm_timeout=int(self.settings.get("split_llm_timeout", 120)),
+            )
             self.progress.emit("Detected {0} split target(s).".format(len(report.get("books") or [])))
             self.finished_ok.emit(report)
         except Exception:
@@ -109,11 +122,12 @@ class SplitMetadataWorker(QThread):
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, epub_path, temp_dir, books):
+    def __init__(self, epub_path, temp_dir, books, settings):
         QThread.__init__(self)
         self.epub_path = Path(epub_path)
         self.temp_dir = Path(temp_dir)
         self.books = list(books)
+        self.settings = dict(settings)
 
     def run(self):
         try:
@@ -141,7 +155,19 @@ class SplitMetadataWorker(QThread):
             self.progress.emit(done, total)
 
             results = []
-            args = metadata_core.default_args()
+            args = metadata_core.default_args(
+                cache_dir=Path(self.settings.get("cache_dir") or Path.home() / ".cache" / "auto_epub_splitter" / "douban"),
+                delay=float(self.settings.get("douban_delay", 3.0)),
+                no_llm=not bool(self.settings.get("use_llm", True)),
+                vllm_base_url=self.settings.get("vllm_base_url") or metadata_core.DEFAULT_VLLM_BASE_URL,
+                model=model_or_none(self.settings.get("model")),
+                llm_timeout=int(self.settings.get("metadata_llm_timeout", 60)),
+                max_candidates=int(self.settings.get("max_candidates", 5)),
+                no_author_extract=not bool(self.settings.get("extract_authors", True)),
+                no_cover_vision=not bool(self.settings.get("use_cover_vision", True)),
+                cover_vision_timeout=int(self.settings.get("cover_vision_timeout", 45)),
+                llm_describe_miss=bool(self.settings.get("llm_describe_miss", False)),
+            )
             for index, (item, output_path) in enumerate(zip(self.books, output_paths), 1):
                 self.status.emit("Enriching metadata {0}/{1}...".format(index, len(output_paths)))
                 self.log.emit("[metadata {0}/{1}] {2}".format(index, len(output_paths), item.get("title", "")))
@@ -186,6 +212,9 @@ class AutoEpubSplitterAction(InterfaceAction):
         self._install_icon()
         self.qaction.triggered.connect(self.plugin_button)
 
+    def apply_settings(self):
+        pass
+
     def _install_icon(self):
         icon_data = self.load_resources(PLUGIN_ICONS).get("images/icon.png")
         if not icon_data:
@@ -202,8 +231,9 @@ class AutoEpubSplitterAction(InterfaceAction):
         if context is None:
             return
         db, book_id, source_mi, epub_path = context
+        settings = get_prefs()
 
-        report = self._detect_with_progress(epub_path)
+        report = self._detect_with_progress(epub_path, settings)
         if report is None:
             return
 
@@ -232,7 +262,7 @@ class AutoEpubSplitterAction(InterfaceAction):
 
         temp_dir = Path(tempfile.mkdtemp(prefix="auto-epub-splitter-"))
         try:
-            results = self._split_and_enrich_with_progress(epub_path, temp_dir, books)
+            results = self._split_and_enrich_with_progress(epub_path, temp_dir, books, settings)
             if results is None:
                 return
             created_ids = self._add_results_to_calibre(db, book_id, source_mi, results)
@@ -273,10 +303,10 @@ class AutoEpubSplitterAction(InterfaceAction):
 
         return db, book_id, db.get_metadata(book_id, index_is_id=True), epub_path
 
-    def _detect_with_progress(self, epub_path):
+    def _detect_with_progress(self, epub_path, settings):
         dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Detecting split points...")
         state = {"report": None, "error": None}
-        worker = DetectWorker(epub_path)
+        worker = DetectWorker(epub_path, settings)
         worker.progress.connect(dialog.append_log)
         worker.finished_ok.connect(lambda report: state.update(report=report))
         worker.failed.connect(lambda error: state.update(error=error))
@@ -296,10 +326,10 @@ class AutoEpubSplitterAction(InterfaceAction):
             return None
         return state["report"]
 
-    def _split_and_enrich_with_progress(self, epub_path, temp_dir, books):
+    def _split_and_enrich_with_progress(self, epub_path, temp_dir, books, settings):
         dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Preparing split job...")
         state = {"results": None, "error": None}
-        worker = SplitMetadataWorker(epub_path, temp_dir, books)
+        worker = SplitMetadataWorker(epub_path, temp_dir, books, settings)
         worker.status.connect(dialog.set_status)
         worker.progress.connect(dialog.set_progress)
         worker.log.connect(dialog.append_log)

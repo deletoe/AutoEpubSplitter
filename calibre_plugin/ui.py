@@ -89,6 +89,15 @@ def model_or_none(value):
     return value or None
 
 
+def metadata_sources_from_settings(settings):
+    sources = []
+    if settings.get("source_douban", True):
+        sources.append("douban")
+    if settings.get("source_google_books", False):
+        sources.append("google_books")
+    return sources or ["douban"]
+
+
 class DetectWorker(QThread):
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal(object)
@@ -167,6 +176,8 @@ class SplitMetadataWorker(QThread):
                 no_cover_vision=not bool(self.settings.get("use_cover_vision", True)),
                 cover_vision_timeout=int(self.settings.get("cover_vision_timeout", 45)),
                 llm_describe_miss=bool(self.settings.get("llm_describe_miss", False)),
+                metadata_sources=metadata_sources_from_settings(self.settings),
+                google_books_api_key=self.settings.get("google_books_api_key", ""),
             )
             for index, (item, output_path) in enumerate(zip(self.books, output_paths), 1):
                 self.status.emit("Enriching metadata {0}/{1}...".format(index, len(output_paths)))

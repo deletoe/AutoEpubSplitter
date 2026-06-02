@@ -53,6 +53,8 @@ def default_args(
     no_cover_vision: bool = False,
     cover_vision_timeout: int = 45,
     llm_describe_miss: bool = False,
+    metadata_sources: Optional[List[str]] = None,
+    google_books_api_key: str = "",
 ) -> argparse.Namespace:
     return argparse.Namespace(
         cache_dir=Path(cache_dir or Path.home() / ".cache" / "auto_epub_splitter" / "douban"),
@@ -68,6 +70,8 @@ def default_args(
         no_cover_vision=no_cover_vision,
         cover_vision_timeout=cover_vision_timeout,
         llm_describe_miss=llm_describe_miss,
+        metadata_sources=metadata_sources or ["douban"],
+        google_books_api_key=google_books_api_key,
         work_hard=False,
     )
 
@@ -557,7 +561,64 @@ def douban_search(title: str, cache_dir: Path, delay: float) -> List[Dict[str, A
     return candidates
 
 
+def google_books_search(title: str, author_hint: str, cache_dir: Path, delay: float, api_key: str = "") -> List[Dict[str, Any]]:
+    query = f"{title} {author_hint}".strip() or title
+    params = {
+        "q": query,
+        "maxResults": "10",
+        "printType": "books",
+        "langRestrict": "zh" if re.search(r"[\u4e00-\u9fff]", title + author_hint) else "",
+    }
+    if api_key:
+        params["key"] = api_key
+    url = "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode({k: v for k, v in params.items() if v})
+    try:
+        data = http_get(url, cache_dir, delay).decode("utf-8", errors="replace")
+        rows = json.loads(data).get("items", [])
+    except Exception:
+        return []
+
+    candidates = []
+    for row in rows:
+        info = row.get("volumeInfo") or {}
+        title_value = clean_text(info.get("title", ""))
+        subtitle = clean_text(info.get("subtitle", ""))
+        if subtitle and subtitle not in title_value:
+            title_value = f"{title_value}: {subtitle}" if title_value else subtitle
+        identifiers = info.get("industryIdentifiers") or []
+        isbn = ""
+        for ident in identifiers:
+            if ident.get("type") in {"ISBN_13", "ISBN_10"} and ident.get("identifier"):
+                isbn = clean_text(ident.get("identifier"))
+                if ident.get("type") == "ISBN_13":
+                    break
+        image_links = info.get("imageLinks") or {}
+        cover_url = image_links.get("thumbnail") or image_links.get("smallThumbnail") or ""
+        if cover_url.startswith("http://"):
+            cover_url = "https://" + cover_url[len("http://") :]
+        candidates.append(
+            {
+                "id": str(row.get("id", "")),
+                "title": title_value,
+                "url": info.get("infoLink", ""),
+                "cover_url": cover_url,
+                "authors": [normalize_author(x) for x in info.get("authors", []) if normalize_author(x)],
+                "publisher": clean_text(info.get("publisher", "")),
+                "date": clean_text(info.get("publishedDate", "")),
+                "description": clean_text(info.get("description", "")),
+                "isbn": isbn,
+                "tags": [clean_text(x) for x in info.get("categories", []) if clean_text(x)][:8],
+                "rating": info.get("averageRating"),
+                "rating_count": info.get("ratingsCount"),
+                "source": "google_books",
+            }
+        )
+    return candidates
+
+
 def parse_subject_page(candidate: Dict[str, Any], cache_dir: Path, delay: float) -> Dict[str, Any]:
+    if candidate.get("source") == "google_books":
+        return candidate
     url = candidate.get("url")
     if not url:
         return candidate
@@ -710,12 +771,13 @@ def choose_with_llm(
             }
         )
     prompt = (
-        "你是书籍元数据清洗助手。请从豆瓣候选中选择最匹配目标书的一项，并清洗最终元数据。\n"
+        "你是书籍元数据清洗助手。请从多个来源的候选中选择最匹配目标书的一项，并清洗最终元数据。\n"
         f"目标标题：{title}\n目标作者线索：{', '.join(authors)}\n\n"
         "规则：标题尽量只保留主标题；必要时保留主标题+副标题。删除推荐语、版本说明、套装说明。"
         "作者只保留主要作者/编者，不要译者。外国或古代作者尽量保留国别方括号，例如 [美] 杰克·伦敦。"
         "如果目标作者线索是简称，而豆瓣候选作者明显是同一作者的更完整译名，应使用更完整译名。"
-        "如果候选明显不匹配，selected_index 返回 null。不要编造豆瓣没有给出的 ISBN/出版社等事实。\n\n"
+        "如果候选明显不匹配，selected_index 返回 null。不要编造候选来源没有给出的 ISBN/出版社等事实。"
+        "中文书优先相信豆瓣的中文标题、作者和简介；外文书可优先相信 Google Books 的原文元数据。\n\n"
         "只输出 JSON："
         '{"selected_index":0,"confidence":0.95,"metadata":{"title":"...","authors":["..."],"description":"...","publisher":"","date":"","isbn":"","tags":[],"rating":"","rating_count":""},"reason":"..."}\n\n'
         f"候选：{json.dumps(compact, ensure_ascii=False)}"
@@ -932,15 +994,21 @@ def find_metadata(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Nam
     author_hints, author_source = resolve_author_hints(epub_path, epub_meta, args)
     author_hint = author_hints[0] if author_hints else ""
 
-    candidates = douban_suggest(title, author_hint, args.cache_dir, args.delay)
-    if author_hint:
-        candidates += douban_search(f"{title} {author_hint}", args.cache_dir, args.delay)
-    candidates += douban_search(title, args.cache_dir, args.delay)
+    sources = set(getattr(args, "metadata_sources", None) or ["douban"])
+    candidates: List[Dict[str, Any]] = []
+    if "douban" in sources:
+        candidates += douban_suggest(title, author_hint, args.cache_dir, args.delay)
+        if author_hint:
+            candidates += douban_search(f"{title} {author_hint}", args.cache_dir, args.delay)
+        candidates += douban_search(title, args.cache_dir, args.delay)
+    if "google_books" in sources:
+        candidates += google_books_search(title, author_hint, args.cache_dir, args.delay, getattr(args, "google_books_api_key", "") or "")
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for cand in candidates:
-        if cand.get("id") and cand["id"] not in by_id:
-            by_id[cand["id"]] = cand
+        key = f"{cand.get('source', '')}:{cand.get('id', '') or cand.get('url', '')}"
+        if key and key not in by_id:
+            by_id[key] = cand
     candidates = sorted(by_id.values(), key=lambda c: score_candidate(title, author_hints, c), reverse=True)[: args.max_candidates]
     detailed = [parse_subject_page(c, args.cache_dir, args.delay) for c in candidates]
     plausible = [c for c in detailed if plausible_candidate(title, author_hints, c)]
@@ -965,7 +1033,7 @@ def find_metadata(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Nam
             except Exception as exc:
                 print(f"[warn] LLM fallback description failed for {title}: {exc}", file=sys.stderr)
     else:
-        selected["_match"] = "douban"
+        selected["_match"] = selected.get("source") or "metadata"
 
     selected["title"] = strip_title_noise(selected.get("title") or title)
     selected_authors = [normalize_author(x) for x in selected.get("authors", []) if normalize_author(x)]

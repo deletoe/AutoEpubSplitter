@@ -19,6 +19,9 @@ DEFAULT_PREFS = {
     "max_candidates": 5,
     "cache_dir": str(Path.home() / ".cache" / "auto_epub_splitter" / "douban"),
     "llm_describe_miss": False,
+    "source_douban": True,
+    "source_google_books": False,
+    "google_books_api_key": "",
 }
 
 prefs = JSONConfig("plugins/AutoEpubSplitter")
@@ -86,6 +89,18 @@ class ConfigWidget(QWidget):
         self.llm_describe_miss.setChecked(bool(values["llm_describe_miss"]))
         form.addRow("", self.llm_describe_miss)
 
+        self.source_douban = QCheckBox("Use Douban Books metadata source")
+        self.source_douban.setChecked(bool(values["source_douban"]))
+        form.addRow("", self.source_douban)
+
+        self.source_google_books = QCheckBox("Use Google Books metadata source")
+        self.source_google_books.setChecked(bool(values["source_google_books"]))
+        form.addRow("", self.source_google_books)
+
+        self.google_books_api_key = QLineEdit(str(values["google_books_api_key"] or ""))
+        self.google_books_api_key.setPlaceholderText("Optional; public API works without a key but has lower quota")
+        form.addRow("Google Books API key", self.google_books_api_key)
+
         self.douban_delay = QDoubleSpinBox()
         self.douban_delay.setRange(0.0, 30.0)
         self.douban_delay.setDecimals(1)
@@ -111,6 +126,9 @@ class ConfigWidget(QWidget):
         prefs["cover_vision_timeout"] = int(self.cover_vision_timeout.value())
         prefs["extract_authors"] = self.extract_authors.isChecked()
         prefs["llm_describe_miss"] = self.llm_describe_miss.isChecked()
+        prefs["source_douban"] = self.source_douban.isChecked()
+        prefs["source_google_books"] = self.source_google_books.isChecked()
+        prefs["google_books_api_key"] = str(self.google_books_api_key.text()).strip()
         prefs["douban_delay"] = float(self.douban_delay.value())
         prefs["max_candidates"] = int(self.max_candidates.value())
         prefs["cache_dir"] = str(self.cache_dir.text()).strip() or DEFAULT_PREFS["cache_dir"]

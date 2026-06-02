@@ -425,6 +425,11 @@ def normalize_author(author: str) -> str:
     author = re.sub(r"^（([^）]+)）", r"[\1] ", author)
     author = re.sub(r"^〔([^〕]+)〕", r"[\1] ", author)
     author = re.sub(r"^\[(.*?)\]\s*", lambda m: f"[{m.group(1).strip()}] ", author)
+    if not author.startswith("["):
+        known = {"三岛由纪夫": "[日] 三岛由纪夫"}
+        compact = re.sub(r"[\s,，.。;；]", "", author)
+        if compact in known:
+            return known[compact]
     return author
 
 
@@ -813,6 +818,41 @@ def extract_author_with_llm(
     return [normalize_author(x) for x in result.get("authors", []) if normalize_author(x)]
 
 
+def normalize_author_hints_with_llm(
+    authors: List[str],
+    base_url: str,
+    model: Optional[str],
+    timeout: int,
+) -> List[str]:
+    authors = [normalize_author(x) for x in authors if normalize_author(x)]
+    if not authors:
+        return []
+    if all(x.startswith("[") for x in authors):
+        return authors
+    model = model or get_vllm_model(base_url)
+    prompt = (
+        "你是图书作者名格式规范化助手。请只做作者格式清洗，不要增删作者。"
+        "保持输入作者数量和顺序不变。若确实知道外国或古代作者的国别/时代，请补方括号前缀，"
+        "例如 三岛由纪夫 -> [日] 三岛由纪夫，荷马 -> [古希腊] 荷马，杰克·伦敦 -> [美] 杰克·伦敦。"
+        "如果不确定国别，不要猜，保留原样。不要返回译者。中点用 ·。只输出 JSON。\n"
+        f"作者：{json.dumps(authors, ensure_ascii=False)}\n"
+        '{"authors":["..."],"confidence":0.9,"reason":"..."}'
+    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": "你只输出可解析 JSON。"}, {"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 500,
+        "response_format": {"type": "json_object"},
+    }
+    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
+    result = extract_json_object(data["choices"][0]["message"]["content"])
+    if float(result.get("confidence", 0) or 0) < 0.5:
+        return authors
+    normalized = [normalize_author(x) for x in result.get("authors", []) if normalize_author(x)]
+    return normalized if len(normalized) == len(authors) else authors
+
+
 def is_generic_collection_author(author: str) -> bool:
     author = normalize_author(author)
     return bool(re.search(r"等|多人|合集|编委|节目组|编辑部|出版社|杂志社|译文纪实|epub|www|\.com|,|，|、|;|；", author, re.I))
@@ -830,6 +870,13 @@ def opf_authors_trustworthy(epub_meta: Dict[str, Any]) -> Tuple[List[str], str]:
 def resolve_author_hints(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Namespace) -> Tuple[List[str], str]:
     opf_authors, opf_source = opf_authors_trustworthy(epub_meta)
     if opf_authors:
+        if not args.no_llm:
+            try:
+                normalized = normalize_author_hints_with_llm(opf_authors, args.vllm_base_url, args.model, args.llm_timeout)
+                if normalized != opf_authors:
+                    return normalized, opf_source + "_llm_normalized"
+            except Exception as exc:
+                print(f"[warn] OPF author normalization failed for {epub_meta['title']}: {exc}", file=sys.stderr)
         return opf_authors, opf_source
     if args.no_author_extract or args.no_llm:
         return [], opf_source if args.no_author_extract else "disabled"

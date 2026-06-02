@@ -2,6 +2,10 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 from calibre.gui2 import error_dialog, info_dialog
 from calibre.gui2.actions import InterfaceAction
+from qt.core import QIcon, QPixmap
+
+
+PLUGIN_ICONS = ["images/icon.png"]
 
 
 class AutoEpubSplitterAction(InterfaceAction):
@@ -15,7 +19,16 @@ class AutoEpubSplitterAction(InterfaceAction):
     action_type = "global"
 
     def genesis(self):
+        self._install_icon()
         self.qaction.triggered.connect(self.plugin_button)
+
+    def _install_icon(self):
+        icon_data = self.load_resources(PLUGIN_ICONS).get("images/icon.png")
+        if not icon_data:
+            return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(icon_data):
+            self.qaction.setIcon(QIcon(pixmap))
 
     def location_selected(self, loc):
         self.qaction.setEnabled(loc == "library")
@@ -55,4 +68,3 @@ class AutoEpubSplitterAction(InterfaceAction):
             ).format(title=mi.title),
             show=True,
         )
-

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib
 import importlib.util
 import json
 import os
@@ -31,11 +32,24 @@ DEFAULT_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://10.130.92.107:80
 
 
 def load_epubsplit():
+    try:
+        module = importlib.import_module("calibre_plugins.auto_epub_splitter.epubsplit")
+    except Exception:
+        module = None
+    if module is not None:
+        _suppress_epubsplit_warnings()
+        return module
+
     spec = importlib.util.spec_from_file_location("calibre_plugins.auto_epub_splitter.epubsplit_local", EPUBSPLIT_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot import EpubSplit from {EPUBSPLIT_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _suppress_epubsplit_warnings()
+    return module
+
+
+def _suppress_epubsplit_warnings():
     try:
         from bs4 import XMLParsedAsHTMLWarning
 
@@ -43,7 +57,6 @@ def load_epubsplit():
         warnings.filterwarnings("ignore", category=DeprecationWarning, module="epubsplit_local")
     except Exception:
         pass
-    return module
 
 
 def clean_text(value: Any, limit: int = 240) -> str:

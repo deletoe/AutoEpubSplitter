@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import html
 import shutil
 import tempfile
+import traceback
 from pathlib import Path
 
 from calibre.ebooks.metadata import MetaInformation
@@ -84,7 +85,7 @@ class AutoEpubSplitterAction(InterfaceAction):
                 self.gui,
                 "Split Detection Failed",
                 "Auto EPUB Splitter could not detect split points for this EPUB.",
-                det_msg=str(exc),
+                det_msg=traceback.format_exc(),
                 show=True,
             )
             return
@@ -137,7 +138,7 @@ class AutoEpubSplitterAction(InterfaceAction):
                 self.gui,
                 "Split Failed",
                 "Auto EPUB Splitter failed while creating split books.",
-                det_msg=str(exc),
+                det_msg=traceback.format_exc(),
                 show=True,
             )
             return

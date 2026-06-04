@@ -78,6 +78,7 @@ dist/AutoEpubSplitter.zip
 - OpenAI-compatible base URL。
 - 模型名。留空则使用 `/v1/models` 返回的第一个模型。
 - 拆分判断 LLM timeout。
+- 拆分判断 LLM max tokens。默认 `65536`。
 - 元数据清洗 LLM timeout。
 - 是否启用封面视觉识别。
 - 封面视觉 timeout。
@@ -118,6 +119,7 @@ python3 auto_split_epub.py --overwrite -o split-output "samples/example-collecti
 - `--model`: 模型名。不传时自动读取 `/v1/models` 的第一个模型。
 - `--llm-timeout`: 等待 LLM 的秒数。
 - `--expected-count`: 可选预计输出数量提示。它只是提示，不会强行裁剪或补足结果。
+- `--split-llm-max-tokens 65536`: 拆分判断阶段 LLM 响应的最大 token 数。
 - `--report report.json`: 保存拆分识别报告。
 
 ## 命令行元数据补全

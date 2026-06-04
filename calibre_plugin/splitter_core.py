@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional
 ROOT = Path(__file__).resolve().parent
 EPUBSPLIT_PATH = ROOT / "epubsplit.py"
 DEFAULT_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://10.130.92.107:8000")
+DEFAULT_SPLIT_LLM_MAX_TOKENS = 65536
 
 
 def load_epubsplit():
@@ -227,9 +228,10 @@ def build_prompt(
         "5. 起点必须来自候选位置 JSON 中的 line 数字。只返回你认为应该成为输出 EPUB 的起始 line；下一个起始 line 前的内容会归入当前输出。\n"
         "6. title 必须是最终输出 EPUB 的干净书名：删除书名号、序号、套装/全集/文集前缀、文件名或作家名包装。"
         "例如“1. 悲惨世界”“雨果文集01.悲惨世界”“维克多·雨果作品集：悲惨世界（上中下）”都应返回“悲惨世界”。\n"
-        "7. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
+        "7. reason 必须非常短，每项不超过 24 个汉字；notes 最多 3 条。不要解释剧情，不要展开目录分析。\n"
+        "8. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
         "只输出严格 JSON，不要 Markdown：\n"
-        '{"books":[{"title":"输出书名","start_line":8,"confidence":0.92,"reason":"为什么这是单册起点，或为什么保留多卷为整体"}],"notes":[]}\n\n'
+        '{"books":[{"title":"输出书名","start_line":8,"confidence":0.92,"reason":"单册起点/多卷合并"}],"notes":[]}\n\n'
         "目录树大纲（缩进代表目录层级；方括号内是可拆分 line；箭头后是直接子项摘要）：\n"
         f"{chr(10).join(toc_outline)}\n\n"
         "候选断点（只列带标题信息的 line；start_line 必须从这些 line 中选择）：\n"
@@ -314,6 +316,14 @@ def extract_json_object(text: str) -> Dict[str, Any]:
         return json.loads(text[start : end + 1])
 
 
+def llm_max_tokens(lines: List[Dict[str, Any]], configured: Optional[int] = None) -> int:
+    titled = sum(1 for line in lines if line_title(line))
+    dynamic = max(2048, titled * 12)
+    if configured and configured > 0:
+        return max(dynamic, int(configured))
+    return max(dynamic, DEFAULT_SPLIT_LLM_MAX_TOKENS)
+
+
 def ask_llm(
     epub_path: Path,
     lines: List[Dict[str, Any]],
@@ -322,6 +332,7 @@ def ask_llm(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    max_tokens: Optional[int] = None,
     stream_callback: Optional[Any] = None,
     cancel_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -333,7 +344,7 @@ def ask_llm(
             {"role": "user", "content": build_prompt(epub_path, lines, expected_count, toc_nodes)},
         ],
         "temperature": 0,
-        "max_tokens": 2048,
+        "max_tokens": llm_max_tokens(lines, max_tokens),
         "response_format": {"type": "json_object"},
     }
     content = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
@@ -344,14 +355,23 @@ def ask_llm(
 
 def clean_book_title(title: str) -> str:
     title = clean_text(title, 120)
-    title = title.strip(" 《》「」『』“”\"'")
+    title = title.strip()
+    outer_pairs = [("《", "》"), ("「", "」"), ("『", "』"), ("“", "”"), ('"', '"'), ("'", "'")]
+    changed = True
+    while changed and len(title) >= 2:
+        changed = False
+        for left, right in outer_pairs:
+            if title.startswith(left) and title.endswith(right):
+                title = title[1:-1].strip()
+                changed = True
+                break
     title = re.sub(r"\s*[（(]\s*[上中下]+(?:[、,，和 ]*[上中下]+)*\s*[）)]\s*$", "", title)
     title = re.sub(r"\s*[（(]\s*(?:上|中|下)?\s*(?:册|卷)\s*[）)]\s*$", "", title)
     title = re.sub(r"^\s*(?:第\s*)?[0-9一二三四五六七八九十百零〇]{1,4}\s*[.．、:：\-]\s*", "", title)
     title = re.sub(r"^\s*[^:：.．、\-]{1,24}(?:全集|文集|作品集|套装|合集)\s*[0-9一二三四五六七八九十百零〇]{0,4}\s*[.．、:：\-]\s*", "", title)
     title = re.sub(r"^\s*[^:：.．、\-]{1,24}(?:全集|文集|作品集|套装|合集)\s*[：:]\s*", "", title)
     title = re.sub(r"\s*[（(]\s*[^）)]*(?:套装|全集|文集|推荐|新版|珍藏|插图|纪念|精装|修订)[^）)]*[）)]\s*$", "", title)
-    return title.strip(" -_·《》「」『』“”\"'")
+    return title.strip(" -_·")
 
 
 NOISE_PATTERNS = [
@@ -595,6 +615,7 @@ def detect_split_ranges(
     vllm_base_url: str = DEFAULT_VLLM_BASE_URL,
     model: Optional[str] = None,
     llm_timeout: int = 120,
+    llm_max_tokens_value: Optional[int] = DEFAULT_SPLIT_LLM_MAX_TOKENS,
     stream_callback: Optional[Any] = None,
     cancel_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -622,6 +643,7 @@ def detect_split_ranges(
                 vllm_base_url,
                 model,
                 llm_timeout,
+                max_tokens=llm_max_tokens_value,
                 stream_callback=stream_callback,
                 cancel_callback=cancel_callback,
             )

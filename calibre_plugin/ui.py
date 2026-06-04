@@ -177,6 +177,12 @@ class DetectWorker(QThread):
                 vllm_base_url=self.settings.get("vllm_base_url") or splitter_core.DEFAULT_VLLM_BASE_URL,
                 model=model_or_none(self.settings.get("model")),
                 llm_timeout=int(self.settings.get("split_llm_timeout", 120)),
+                llm_max_tokens_value=int(
+                    self.settings.get(
+                        "split_llm_max_tokens",
+                        getattr(splitter_core, "DEFAULT_SPLIT_LLM_MAX_TOKENS", 65536),
+                    )
+                ),
                 stream_callback=self.llm_delta.emit,
                 cancel_callback=self.is_cancelled,
             )

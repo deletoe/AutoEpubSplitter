@@ -11,6 +11,7 @@ DEFAULT_PREFS = {
     "vllm_base_url": "http://10.130.92.107:8000",
     "model": "",
     "split_llm_timeout": 120,
+    "split_llm_max_tokens": 65536,
     "metadata_llm_timeout": 60,
     "cover_vision_timeout": 45,
     "use_cover_vision": True,
@@ -67,6 +68,12 @@ class ConfigWidget(QWidget):
         self.split_llm_timeout.setValue(int(values["split_llm_timeout"]))
         form.addRow("Split LLM timeout seconds", self.split_llm_timeout)
 
+        self.split_llm_max_tokens = QSpinBox()
+        self.split_llm_max_tokens.setRange(2048, 262144)
+        self.split_llm_max_tokens.setSingleStep(4096)
+        self.split_llm_max_tokens.setValue(int(values["split_llm_max_tokens"]))
+        form.addRow("Split LLM max tokens", self.split_llm_max_tokens)
+
         self.metadata_llm_timeout = QSpinBox()
         self.metadata_llm_timeout.setRange(5, 600)
         self.metadata_llm_timeout.setValue(int(values["metadata_llm_timeout"]))
@@ -121,6 +128,7 @@ class ConfigWidget(QWidget):
         prefs["vllm_base_url"] = str(self.vllm_base_url.text()).strip() or DEFAULT_PREFS["vllm_base_url"]
         prefs["model"] = str(self.model.text()).strip()
         prefs["split_llm_timeout"] = int(self.split_llm_timeout.value())
+        prefs["split_llm_max_tokens"] = int(self.split_llm_max_tokens.value())
         prefs["metadata_llm_timeout"] = int(self.metadata_llm_timeout.value())
         prefs["use_cover_vision"] = self.use_cover_vision.isChecked()
         prefs["cover_vision_timeout"] = int(self.cover_vision_timeout.value())

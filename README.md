@@ -78,6 +78,7 @@ Available settings include:
 - OpenAI-compatible base URL.
 - Model name. Leave empty to use the first model returned by `/v1/models`.
 - Split-detection LLM timeout.
+- Split-detection LLM max tokens. Default is `65536`.
 - Metadata-cleanup LLM timeout.
 - Enable cover vision selection.
 - Cover vision timeout.
@@ -118,6 +119,7 @@ Common options:
 - `--model`: Model id. Defaults to the first `/v1/models` entry.
 - `--llm-timeout`: Seconds to wait for the LLM.
 - `--expected-count`: Optional output-count hint. It is only a hint and does not force trimming or padding.
+- `--split-llm-max-tokens 65536`: Max tokens for split-detection LLM responses.
 - `--report report.json`: Write a split detection report.
 
 ## Command-Line Metadata Enrichment

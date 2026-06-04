@@ -462,6 +462,7 @@ def normalize_author(author: str) -> str:
     author = re.sub(r"^（([^）]+)）", r"[\1] ", author)
     author = re.sub(r"^〔([^〕]+)〕", r"[\1] ", author)
     author = re.sub(r"^\[(.*?)\]\s*", lambda m: f"[{m.group(1).strip()}] ", author)
+    author = re.sub(r"^\[(?:中|中国|现代中国|当代中国)\]\s*", "", author)
     if not author.startswith("["):
         known = {
             "三岛由纪夫": "[日] 三岛由纪夫",
@@ -899,6 +900,7 @@ def extract_author_with_llm(
         "不要返回译者、校者、设计者、出品人、出版机构。"
         "如果无法确定作者，返回空数组。"
         "作者格式要规范：外国/古代作者尽量用国别方括号，例如 [古希腊] 荷马、[美] 杰克·伦敦；中点用 ·。"
+        "中国现代/当代作者不要加 [中] 或 [中国]，直接返回姓名，例如 胡适、鲁迅、张爱玲。"
         "删除“著/编著/主编”等角色词。只输出 JSON。\n\n"
         f"书名：{title}\n"
         f"前几页文本：\n{front_text}\n\n"
@@ -934,6 +936,7 @@ def normalize_author_hints_with_llm(
         "你是图书作者名格式规范化助手。请只做作者格式清洗，不要增删作者。"
         "保持输入作者数量和顺序不变。若确实知道外国或古代作者的国别/时代，请补方括号前缀，"
         "例如 三岛由纪夫 -> [日] 三岛由纪夫，荷马 -> [古希腊] 荷马，杰克·伦敦 -> [美] 杰克·伦敦。"
+        "中国现代/当代作者不要加 [中] 或 [中国]，如果输入已有这类前缀请删除，例如 [中] 胡适 -> 胡适。"
         "如果不确定国别，不要猜，保留原样。不要返回译者。中点用 ·。只输出 JSON。\n"
         f"作者：{json.dumps(authors, ensure_ascii=False)}\n"
         '{"authors":["..."],"confidence":0.9,"reason":"..."}'

@@ -9,7 +9,7 @@ from zipfile import ZipFile
 from xml.dom.minidom import parseString
 
 from calibre.ebooks.metadata import MetaInformation
-from calibre.gui2 import error_dialog, info_dialog, question_dialog
+from calibre.gui2 import error_dialog, info_dialog
 from calibre.gui2.actions import InterfaceAction
 from calibre_plugins.auto_epub_splitter.config import get_prefs
 from calibre_plugins.auto_epub_splitter import metadata_core, splitter_core
@@ -33,6 +33,8 @@ PLUGIN_ICONS = ["images/icon.png"]
 
 
 class ProgressDialog(QDialog):
+    cancel_requested = pyqtSignal()
+
     def __init__(self, parent, title, message):
         QDialog.__init__(self, parent)
         self.setWindowTitle(title)
@@ -44,12 +46,15 @@ class ProgressDialog(QDialog):
         self.progress.setRange(0, 0)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._request_cancel)
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.accept)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
+        buttons.addWidget(self.cancel_button)
         buttons.addWidget(self.close_button)
 
         layout = QVBoxLayout()
@@ -72,16 +77,62 @@ class ProgressDialog(QDialog):
         self.log.append(str(message))
         self.log.moveCursor(QTextCursor.MoveOperation.End)
 
+    def append_text(self, text):
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+        self.log.insertPlainText(str(text))
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+
     def finish(self, message=None):
         if message:
             self.set_status(message)
+        self.cancel_button.setEnabled(False)
         self.close_button.setEnabled(True)
+
+    def _request_cancel(self):
+        self.cancel_button.setEnabled(False)
+        self.append_log("\nCancel requested. Waiting for the current step to stop...")
+        self.cancel_requested.emit()
 
     def closeEvent(self, event):
         if self.close_button.isEnabled():
             event.accept()
         else:
             event.ignore()
+
+
+class SplitConfirmDialog(QDialog):
+    def __init__(self, parent, source_title, report, detail):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("Auto EPUB Splitter")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(440)
+
+        books = report.get("books") or []
+        label = QLabel(
+            "Create and enrich {count} split books from:\n{title}".format(
+                count=len(books),
+                title=source_title or report.get("input", ""),
+            )
+        )
+        self.detail = QTextEdit()
+        self.detail.setReadOnly(True)
+        self.detail.setPlainText(detail)
+
+        self.create_button = QPushButton("Create")
+        self.cancel_button = QPushButton("Cancel")
+        self.create_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.create_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(label)
+        layout.addWidget(self.detail)
+        layout.addLayout(buttons)
+        self.setLayout(layout)
 
 
 def model_or_none(value):
@@ -100,6 +151,7 @@ def metadata_sources_from_settings(settings):
 
 class DetectWorker(QThread):
     progress = pyqtSignal(str)
+    llm_delta = pyqtSignal(str)
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
@@ -107,17 +159,30 @@ class DetectWorker(QThread):
         QThread.__init__(self)
         self.epub_path = Path(epub_path)
         self.settings = dict(settings)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def is_cancelled(self):
+        return self._cancel
 
     def run(self):
         try:
             self.progress.emit("Reading EPUB structure...")
+            self.progress.emit("Asking LLM to detect split points...")
             report = splitter_core.detect_split_ranges(
                 self.epub_path,
                 use_llm=bool(self.settings.get("use_llm", True)),
                 vllm_base_url=self.settings.get("vllm_base_url") or splitter_core.DEFAULT_VLLM_BASE_URL,
                 model=model_or_none(self.settings.get("model")),
                 llm_timeout=int(self.settings.get("split_llm_timeout", 120)),
+                stream_callback=self.llm_delta.emit,
+                cancel_callback=self.is_cancelled,
             )
+            if self.is_cancelled():
+                self.failed.emit("Canceled by user")
+                return
             self.progress.emit("Detected {0} split target(s).".format(len(report.get("books") or [])))
             self.finished_ok.emit(report)
         except Exception:
@@ -128,6 +193,7 @@ class SplitMetadataWorker(QThread):
     status = pyqtSignal(str)
     progress = pyqtSignal(int, int)
     log = pyqtSignal(str)
+    llm_delta = pyqtSignal(str)
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
@@ -137,6 +203,13 @@ class SplitMetadataWorker(QThread):
         self.temp_dir = Path(temp_dir)
         self.books = list(books)
         self.settings = dict(settings)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def is_cancelled(self):
+        return self._cancel
 
     def run(self):
         try:
@@ -150,6 +223,8 @@ class SplitMetadataWorker(QThread):
             self.status.emit("Writing split EPUBs...")
 
             def split_progress(index, count, title):
+                if self.is_cancelled():
+                    raise RuntimeError("Canceled by user")
                 self.log.emit("[split {0}/{1}] {2}".format(index, count, title))
                 self.progress.emit(index - 1, total)
 
@@ -162,6 +237,9 @@ class SplitMetadataWorker(QThread):
             )
             done = len(output_paths)
             self.progress.emit(done, total)
+            if self.is_cancelled():
+                self.failed.emit("Canceled by user")
+                return
 
             results = []
             args = metadata_core.default_args(
@@ -178,8 +256,13 @@ class SplitMetadataWorker(QThread):
                 llm_describe_miss=bool(self.settings.get("llm_describe_miss", False)),
                 metadata_sources=metadata_sources_from_settings(self.settings),
                 google_books_api_key=self.settings.get("google_books_api_key", ""),
+                stream_callback=self.llm_delta.emit,
+                cancel_callback=self.is_cancelled,
             )
             for index, (item, output_path) in enumerate(zip(self.books, output_paths), 1):
+                if self.is_cancelled():
+                    self.failed.emit("Canceled by user")
+                    return
                 self.status.emit("Enriching metadata {0}/{1}...".format(index, len(output_paths)))
                 self.log.emit("[metadata {0}/{1}] {2}".format(index, len(output_paths), item.get("title", "")))
                 enriched_path = enriched_dir / output_path.name
@@ -260,15 +343,10 @@ class AutoEpubSplitterAction(InterfaceAction):
             return
 
         detail = self._format_detection_detail(report)
-        if not question_dialog(
-            self.gui,
-            "Auto EPUB Splitter",
-            "Create and enrich {count} split books from:\n{title}".format(count=len(books), title=source_mi.title),
-            det_msg=detail,
-            show_copy_button=True,
-            yes_text="Create",
-            no_text="Cancel",
-        ):
+        accepted_code = getattr(QDialog, "Accepted", None)
+        if accepted_code is None:
+            accepted_code = QDialog.DialogCode.Accepted
+        if SplitConfirmDialog(self.gui, source_mi.title, report, detail).exec_() != accepted_code:
             return
 
         temp_dir = Path(tempfile.mkdtemp(prefix="auto-epub-splitter-"))
@@ -318,7 +396,9 @@ class AutoEpubSplitterAction(InterfaceAction):
         dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Detecting split points...")
         state = {"report": None, "error": None}
         worker = DetectWorker(epub_path, settings)
+        dialog.cancel_requested.connect(worker.cancel)
         worker.progress.connect(dialog.append_log)
+        worker.llm_delta.connect(dialog.append_text)
         worker.finished_ok.connect(lambda report: state.update(report=report))
         worker.failed.connect(lambda error: state.update(error=error))
         worker.finished.connect(lambda: dialog.finish("Detection finished."))
@@ -327,6 +407,8 @@ class AutoEpubSplitterAction(InterfaceAction):
         dialog.exec_()
         worker.wait()
         if state["error"]:
+            if "Canceled by user" in state["error"]:
+                return None
             error_dialog(
                 self.gui,
                 "Split Detection Failed",
@@ -341,9 +423,11 @@ class AutoEpubSplitterAction(InterfaceAction):
         dialog = ProgressDialog(self.gui, "Auto EPUB Splitter", "Preparing split job...")
         state = {"results": None, "error": None}
         worker = SplitMetadataWorker(epub_path, temp_dir, books, settings)
+        dialog.cancel_requested.connect(worker.cancel)
         worker.status.connect(dialog.set_status)
         worker.progress.connect(dialog.set_progress)
         worker.log.connect(dialog.append_log)
+        worker.llm_delta.connect(dialog.append_text)
         worker.finished_ok.connect(lambda results: state.update(results=results))
         worker.failed.connect(lambda error: state.update(error=error))
         worker.finished.connect(lambda: dialog.finish("Processing finished."))
@@ -352,6 +436,8 @@ class AutoEpubSplitterAction(InterfaceAction):
         dialog.exec_()
         worker.wait()
         if state["error"]:
+            if "Canceled by user" in state["error"]:
+                return None
             error_dialog(
                 self.gui,
                 "Split Failed",

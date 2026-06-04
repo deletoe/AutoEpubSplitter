@@ -55,6 +55,8 @@ def default_args(
     llm_describe_miss: bool = False,
     metadata_sources: Optional[List[str]] = None,
     google_books_api_key: str = "",
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         cache_dir=Path(cache_dir or Path.home() / ".cache" / "auto_epub_splitter" / "douban"),
@@ -72,6 +74,8 @@ def default_args(
         llm_describe_miss=llm_describe_miss,
         metadata_sources=metadata_sources or ["douban"],
         google_books_api_key=google_books_api_key,
+        stream_callback=stream_callback,
+        cancel_callback=cancel_callback,
         work_hard=False,
     )
 
@@ -115,6 +119,54 @@ def http_json(url: str, payload: Optional[Dict[str, Any]] = None, timeout: int =
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def chat_completion_content(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
+) -> str:
+    if not stream_callback:
+        data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
+        return data["choices"][0]["message"]["content"]
+
+    streamed = dict(payload)
+    streamed["stream"] = True
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(streamed, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+    )
+    chunks: List[str] = []
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Canceled by user")
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece is None:
+                piece = choices[0].get("text")
+            if not piece:
+                continue
+            chunks.append(piece)
+            stream_callback(piece)
+    return "".join(chunks)
 
 
 def get_vllm_model(base_url: str) -> str:
@@ -286,6 +338,8 @@ def choose_cover_with_vision(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> Optional[int]:
     if not candidates:
         return None
@@ -323,8 +377,14 @@ def choose_cover_with_vision(
         "temperature": 0,
         "max_tokens": 500,
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(
+        base_url,
+        payload,
+        timeout,
+        stream_callback,
+        cancel_callback,
+    )
+    result = extract_json_object(content_text)
     idx = result.get("selected_index")
     if idx is None:
         return None
@@ -409,10 +469,14 @@ def find_front_cover_image(
                 args.vllm_base_url,
                 args.model,
                 args.cover_vision_timeout,
+                getattr(args, "stream_callback", None),
+                getattr(args, "cancel_callback", None),
             )
             if selected is not None:
                 return vision_candidates[selected]["href"], "front_image_vision"
         except Exception as exc:
+            if "Canceled by user" in str(exc):
+                raise
             print(f"[warn] cover vision check failed for {strip_title_noise(title)}: {exc}", file=sys.stderr)
     if vision_only:
         return None, ""
@@ -757,6 +821,8 @@ def choose_with_llm(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     if not candidates:
         return None
@@ -796,8 +862,8 @@ def choose_with_llm(
         "max_tokens": 1800,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
+    result = extract_json_object(content_text)
     idx = result.get("selected_index")
     if idx is None:
         return None
@@ -822,7 +888,15 @@ def choose_with_llm(
     return selected
 
 
-def fallback_description_with_llm(title: str, authors: List[str], base_url: str, model: Optional[str], timeout: int) -> str:
+def fallback_description_with_llm(
+    title: str,
+    authors: List[str],
+    base_url: str,
+    model: Optional[str],
+    timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
+) -> str:
     model = model or get_vllm_model(base_url)
     prompt = (
         "请为一本书写很短的中文内容简介。只有在你确实知道这本书时才写；不熟悉就返回空字符串。"
@@ -837,12 +911,20 @@ def fallback_description_with_llm(title: str, authors: List[str], base_url: str,
         "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
+    result = extract_json_object(content_text)
     return clean_text(result.get("description", ""))
 
 
-def fallback_metadata_with_llm(title: str, authors: List[str], base_url: str, model: Optional[str], timeout: int) -> Dict[str, Any]:
+def fallback_metadata_with_llm(
+    title: str,
+    authors: List[str],
+    base_url: str,
+    model: Optional[str],
+    timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
     model = model or get_vllm_model(base_url)
     prompt = (
         "请在你确实熟悉这本书时，补充最小元数据。"
@@ -858,8 +940,8 @@ def fallback_metadata_with_llm(title: str, authors: List[str], base_url: str, mo
         "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
+    result = extract_json_object(content_text)
     return {
         "description": clean_text(result.get("description", "")),
         "tags": [clean_text(x) for x in result.get("tags", []) if clean_text(x)][:8],
@@ -890,6 +972,8 @@ def extract_author_with_llm(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> List[str]:
     if not front_text.strip():
         return []
@@ -911,8 +995,8 @@ def extract_author_with_llm(
         "max_tokens": 600,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
+    result = extract_json_object(content_text)
     if float(result.get("confidence", 0) or 0) < 0.45:
         return []
     return [normalize_author(x) for x in result.get("authors", []) if normalize_author(x)]
@@ -923,6 +1007,8 @@ def normalize_author_hints_with_llm(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> List[str]:
     authors = [normalize_author(x) for x in authors if normalize_author(x)]
     if not authors:
@@ -945,8 +1031,8 @@ def normalize_author_hints_with_llm(
         "max_tokens": 500,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    result = extract_json_object(data["choices"][0]["message"]["content"])
+    content_text = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
+    result = extract_json_object(content_text)
     if float(result.get("confidence", 0) or 0) < 0.5:
         return authors
     normalized = [normalize_author(x) for x in result.get("authors", []) if normalize_author(x)]
@@ -972,10 +1058,19 @@ def resolve_author_hints(epub_path: Path, epub_meta: Dict[str, Any], args: argpa
     if opf_authors:
         if not args.no_llm:
             try:
-                normalized = normalize_author_hints_with_llm(opf_authors, args.vllm_base_url, args.model, args.llm_timeout)
+                normalized = normalize_author_hints_with_llm(
+                    opf_authors,
+                    args.vllm_base_url,
+                    args.model,
+                    args.llm_timeout,
+                    getattr(args, "stream_callback", None),
+                    getattr(args, "cancel_callback", None),
+                )
                 if normalized != opf_authors:
                     return normalized, opf_source + "_llm_normalized"
             except Exception as exc:
+                if "Canceled by user" in str(exc):
+                    raise
                 print(f"[warn] OPF author normalization failed for {epub_meta['title']}: {exc}", file=sys.stderr)
         return opf_authors, opf_source
     if args.no_author_extract or args.no_llm:
@@ -989,9 +1084,13 @@ def resolve_author_hints(epub_path: Path, epub_meta: Dict[str, Any], args: argpa
             args.vllm_base_url,
             args.model,
             args.llm_timeout,
+            getattr(args, "stream_callback", None),
+            getattr(args, "cancel_callback", None),
         )
         return authors, "front_matter_llm" if authors else "front_matter_empty"
     except Exception as exc:
+        if "Canceled by user" in str(exc):
+            raise
         print(f"[warn] author extraction failed for {epub_meta['title']}: {exc}", file=sys.stderr)
         return [], "front_matter_failed"
 
@@ -1025,8 +1124,19 @@ def find_metadata(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Nam
     selected: Optional[Dict[str, Any]] = None
     if plausible and not args.no_llm:
         try:
-            selected = choose_with_llm(title, author_hints, plausible, args.vllm_base_url, args.model, args.llm_timeout)
+            selected = choose_with_llm(
+                title,
+                author_hints,
+                plausible,
+                args.vllm_base_url,
+                args.model,
+                args.llm_timeout,
+                getattr(args, "stream_callback", None),
+                getattr(args, "cancel_callback", None),
+            )
         except Exception as exc:
+            if "Canceled by user" in str(exc):
+                raise
             print(f"[warn] LLM candidate selection failed for {title}: {exc}", file=sys.stderr)
     if selected is None and plausible:
         best = plausible[0]
@@ -1037,9 +1147,21 @@ def find_metadata(epub_path: Path, epub_meta: Dict[str, Any], args: argparse.Nam
         selected = {"title": title, "authors": author_hints, "description": "", "tags": [], "_match": "miss"}
         if args.llm_describe_miss and not args.no_llm:
             try:
-                selected.update(fallback_metadata_with_llm(title, author_hints, args.vllm_base_url, args.model, args.llm_timeout))
+                selected.update(
+                    fallback_metadata_with_llm(
+                        title,
+                        author_hints,
+                        args.vllm_base_url,
+                        args.model,
+                        args.llm_timeout,
+                        getattr(args, "stream_callback", None),
+                        getattr(args, "cancel_callback", None),
+                    )
+                )
                 selected["_description_source"] = "llm_fallback"
             except Exception as exc:
+                if "Canceled by user" in str(exc):
+                    raise
                 print(f"[warn] LLM fallback description failed for {title}: {exc}", file=sys.stderr)
     else:
         selected["_match"] = selected.get("source") or "metadata"

@@ -212,7 +212,9 @@ def build_prompt(
         "   请只返回这一组的第一个起始 line，用合适的整体标题命名，不要把各卷拆成多个输出。\n"
         "4. 不要选择封面、版权信息、Digital Lab 简介、总目录、目录、前言、序、后记、附录、章节标题、第一章/第二章、第一部/第二部等内部结构。\n"
         "5. 起点必须来自候选位置 JSON 中的 line 数字。只返回你认为应该成为输出 EPUB 的起始 line；下一个起始 line 前的内容会归入当前输出。\n"
-        "6. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
+        "6. title 必须是最终输出 EPUB 的干净书名：删除书名号、序号、套装/全集/文集前缀、文件名或作家名包装。"
+        "例如“1. 悲惨世界”“雨果文集01.悲惨世界”“维克多·雨果作品集：悲惨世界（上中下）”都应返回“悲惨世界”。\n"
+        "7. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
         "只输出严格 JSON，不要 Markdown：\n"
         '{"books":[{"title":"输出书名","start_line":8,"confidence":0.92,"reason":"为什么这是单册起点，或为什么保留多卷为整体"}],"notes":[]}\n\n'
         "目录树大纲（缩进代表目录层级；方括号内是可拆分 line；箭头后是直接子项摘要）：\n"
@@ -227,6 +229,54 @@ def http_json(url: str, payload: Optional[Dict[str, Any]] = None, timeout: int =
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def chat_completion_content(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
+) -> str:
+    if not stream_callback:
+        data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
+        return data["choices"][0]["message"]["content"]
+
+    streamed = dict(payload)
+    streamed["stream"] = True
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(streamed, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    chunks: List[str] = []
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Canceled by user")
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece is None:
+                piece = choices[0].get("text")
+            if not piece:
+                continue
+            chunks.append(piece)
+            stream_callback(piece)
+    return "".join(chunks)
 
 
 def get_vllm_model(base_url: str) -> str:
@@ -259,6 +309,8 @@ def ask_llm(
     base_url: str,
     model: Optional[str],
     timeout: int,
+    stream_callback: Optional[Any] = None,
+    cancel_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     model = model or get_vllm_model(base_url)
     payload = {
@@ -271,11 +323,22 @@ def ask_llm(
         "max_tokens": 2048,
         "response_format": {"type": "json_object"},
     }
-    data = http_json(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
-    content = data["choices"][0]["message"]["content"]
+    content = chat_completion_content(base_url, payload, timeout, stream_callback, cancel_callback)
     result = extract_json_object(content)
     result["_model"] = model
     return result
+
+
+def clean_book_title(title: str) -> str:
+    title = clean_text(title, 120)
+    title = title.strip(" 《》「」『』“”\"'")
+    title = re.sub(r"\s*[（(]\s*[上中下]+(?:[、,，和 ]*[上中下]+)*\s*[）)]\s*$", "", title)
+    title = re.sub(r"\s*[（(]\s*(?:上|中|下)?\s*(?:册|卷)\s*[）)]\s*$", "", title)
+    title = re.sub(r"^\s*(?:第\s*)?[0-9一二三四五六七八九十百零〇]{1,4}\s*[.．、:：\-]\s*", "", title)
+    title = re.sub(r"^\s*[^:：.．、\-]{1,24}(?:全集|文集|作品集|套装|合集)\s*[0-9一二三四五六七八九十百零〇]{0,4}\s*[.．、:：\-]\s*", "", title)
+    title = re.sub(r"^\s*[^:：.．、\-]{1,24}(?:全集|文集|作品集|套装|合集)\s*[：:]\s*", "", title)
+    title = re.sub(r"\s*[（(]\s*[^）)]*(?:套装|全集|文集|推荐|新版|珍藏|插图|纪念|精装|修订)[^）)]*[）)]\s*$", "", title)
+    return title.strip(" -_·《》「」『』“”\"'")
 
 
 NOISE_PATTERNS = [
@@ -465,7 +528,8 @@ def normalize_books(result: Dict[str, Any], lines: List[Dict[str, Any]]) -> List
         if start not in valid_lines or start in seen:
             continue
         seen.add(start)
-        title = clean_text(book.get("title") or line_title(lines[start]) or f"Book {len(books) + 1}", 80)
+        title = clean_book_title(book.get("title") or line_title(lines[start]) or f"Book {len(books) + 1}")
+        title = clean_text(title or f"Book {len(books) + 1}", 80)
         books.append(
             {
                 "title": title,
@@ -521,6 +585,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--vllm-base-url", default=DEFAULT_VLLM_BASE_URL, help="OpenAI-compatible vLLM base URL")
     parser.add_argument("--model", default=None, help="vLLM model id. Defaults to first /v1/models entry")
     parser.add_argument("--llm-timeout", type=int, default=120, help="Seconds to wait for vLLM before falling back")
+    parser.add_argument("--stream-llm", action="store_true", help="Print streamed LLM output to stderr while detecting splits")
     parser.add_argument("--expected-count", type=int, default=None, help="Optional expected output count hint for the detector")
     parser.add_argument("--report", type=Path, default=None, help="Write detection report JSON")
     args = parser.parse_args(argv)
@@ -545,7 +610,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         result = heuristic_books(splitter, lines, expected_count)
     else:
         try:
-            result = ask_llm(epub_path, lines, expected_count, toc_nodes, args.vllm_base_url, args.model, args.llm_timeout)
+            stream_callback = None
+            if args.stream_llm:
+                print("[llm stream]", file=sys.stderr)
+
+                def stream_callback(piece: str) -> None:
+                    print(piece, end="", file=sys.stderr, flush=True)
+
+            result = ask_llm(
+                epub_path,
+                lines,
+                expected_count,
+                toc_nodes,
+                args.vllm_base_url,
+                args.model,
+                args.llm_timeout,
+                stream_callback=stream_callback,
+            )
+            if args.stream_llm:
+                print("\n[/llm stream]", file=sys.stderr)
             source = f"llm:{result.get('_model', args.model or 'auto')}"
         except Exception as exc:
             print(f"[warn] vLLM unavailable or invalid response: {exc}", file=sys.stderr)

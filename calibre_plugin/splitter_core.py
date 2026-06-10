@@ -222,20 +222,49 @@ def build_prompt(
         "1. 输出粒度通常是“单册出版物/一本书”，而不是系列、辑、主题分组、总目录分组、章节、篇章或文章。\n"
         "2. 如果某个顶层目录项下面挂着多本独立书名，它很可能只是系列/分组标题，不要把它作为一本书；应选择它的子级真实书名。\n"
         "   例如父级像“陌生的中国”“日本现场观察”“自然与人”这类主题分组，子级才可能是《寻路中国》《江城》等书。\n"
-        "3. 也存在例外：如果一部连续作品被分成上/下册、第一卷/第二卷、1/2/3/4册，而阅读上应作为整体保留，"
+        "3. 但如果顶层目录项本身是明确书名，且其后紧跟版权信息、序、引言、第一部/第二部、第一章/一/二/三等内部结构，\n"
+        "   它通常就是单册起点；不要因为它有很多章节/部/幕/篇子项就否定父级。\n"
+        "4. 也存在例外：如果一部连续作品被分成上/下册、第一卷/第二卷、1/2/3/4册，而阅读上应作为整体保留，\n"
         "   请只返回这一组的第一个起始 line，用合适的整体标题命名，不要把各卷拆成多个输出。\n"
-        "4. 不要选择封面、版权信息、Digital Lab 简介、总目录、目录、前言、序、后记、附录、章节标题、第一章/第二章、第一部/第二部等内部结构。\n"
-        "5. 起点必须来自候选位置 JSON 中的 line 数字。只返回你认为应该成为输出 EPUB 的起始 line；下一个起始 line 前的内容会归入当前输出。\n"
-        "6. title 必须是最终输出 EPUB 的干净书名：删除书名号、序号、套装/全集/文集前缀、文件名或作家名包装。"
+        "5. 不要选择封面、版权信息、Digital Lab 简介、总目录、目录、前言、序、后记、附录、章节标题、第一章/第二章、第一部/第二部等内部结构。\n"
+        "6. 起点必须来自候选位置 JSON 中的 line 数字。只返回你认为应该成为输出 EPUB 的起始 line；下一个起始 line 前的内容会归入当前输出。\n"
+        "7. 除非候选目录真的完全没有单册起点，否则不要返回空 books。多个同级明确书名连续出现时，通常至少应返回这些书名的起点。\n"
+        "8. title 必须是最终输出 EPUB 的干净书名：删除书名号、序号、套装/全集/文集前缀、文件名或作家名包装。"
         "例如“1. 悲惨世界”“雨果文集01.悲惨世界”“维克多·雨果作品集：悲惨世界（上中下）”都应返回“悲惨世界”。\n"
-        "7. reason 必须非常短，每项不超过 24 个汉字；notes 最多 3 条。不要解释剧情，不要展开目录分析。\n"
-        "8. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
+        "9. reason 必须非常短，每项不超过 24 个汉字；notes 最多 3 条。不要解释剧情，不要展开目录分析。\n"
+        "10. 如果不确定，在 reason 里说明，但仍给出最符合人工直觉的选择。\n\n"
         "只输出严格 JSON，不要 Markdown：\n"
         '{"books":[{"title":"输出书名","start_line":8,"confidence":0.92,"reason":"单册起点/多卷合并"}],"notes":[]}\n\n'
         "目录树大纲（缩进代表目录层级；方括号内是可拆分 line；箭头后是直接子项摘要）：\n"
         f"{chr(10).join(toc_outline)}\n\n"
         "候选断点（只列带标题信息的 line；start_line 必须从这些 line 中选择）：\n"
         f"{chr(10).join(candidate_lines)}"
+    )
+
+
+def build_retry_prompt(
+    epub_path: Path,
+    lines: List[Dict[str, Any]],
+    expected_count: Optional[int],
+    toc_nodes: List[Dict[str, Any]],
+    draft_books: List[Dict[str, Any]],
+) -> str:
+    draft = "\n".join(
+        "[{start}] {title} ({reason})".format(
+            start=book.get("start_line", ""),
+            title=book.get("title", ""),
+            reason=book.get("reason", ""),
+        )
+        for book in draft_books
+    )
+    return (
+        build_prompt(epub_path, lines, expected_count, toc_nodes)
+        + "\n\n重要重试信息：上一次模型返回了空 books，但目录中存在明确候选，这通常不符合人工直觉。"
+        "下面是程序根据目录顶层结构提取的候选单册草案。请像人工一样审核它："
+        "如果草案合理，请直接返回这些单册；如果某些项只是章节/分卷/系列标题，请修正、合并或删除。"
+        "只有在 EPUB 真的没有任何单册起点时，才允许返回空 books。\n"
+        "候选草案：\n"
+        f"{draft}"
     )
 
 
@@ -333,15 +362,21 @@ def ask_llm(
     model: Optional[str],
     timeout: int,
     max_tokens: Optional[int] = None,
+    draft_books: Optional[List[Dict[str, Any]]] = None,
     stream_callback: Optional[Any] = None,
     cancel_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     model = model or get_vllm_model(base_url)
+    prompt = (
+        build_retry_prompt(epub_path, lines, expected_count, toc_nodes, draft_books)
+        if draft_books
+        else build_prompt(epub_path, lines, expected_count, toc_nodes)
+    )
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": "你只输出可解析的 JSON。"},
-            {"role": "user", "content": build_prompt(epub_path, lines, expected_count, toc_nodes)},
+            {"role": "user", "content": prompt},
         ],
         "temperature": 0,
         "max_tokens": llm_max_tokens(lines, max_tokens),
@@ -657,6 +692,42 @@ def detect_split_ranges(
         result = heuristic_books(splitter, lines, expected_count)
 
     books = normalize_books(result, lines)
+    if use_llm and source.startswith("llm:") and not books:
+        draft = heuristic_books(splitter, lines, expected_count)
+        draft_books = normalize_books(draft, lines)
+        retry_result: Optional[Dict[str, Any]] = None
+        if draft_books:
+            try:
+                if stream_callback:
+                    stream_callback("\n[retrying with TOC draft]\n")
+                retry_result = ask_llm(
+                    epub_path,
+                    lines,
+                    expected_count,
+                    toc_nodes,
+                    vllm_base_url,
+                    model,
+                    llm_timeout,
+                    max_tokens=llm_max_tokens_value,
+                    draft_books=draft_books,
+                    stream_callback=stream_callback,
+                    cancel_callback=cancel_callback,
+                )
+                retry_result.setdefault("notes", []).append("LLM retried with heuristic TOC draft after empty response")
+                retry_books = normalize_books(retry_result, lines)
+                if retry_books:
+                    result = retry_result
+                    source = f"llm-retry:{retry_result.get('_model', model or 'auto')}"
+                    books = retry_books
+            except Exception as exc:
+                if "Canceled by user" in str(exc):
+                    raise
+                draft.setdefault("notes", []).append(f"LLM empty-response retry failed: {exc}")
+        if not books:
+            draft.setdefault("notes", []).append("LLM returned no valid split points; used heuristic fallback")
+            result = draft
+            source = "heuristic"
+            books = draft_books
     ranges = line_ranges(books, lines) if books else []
     return {
         "input": str(epub_path),
